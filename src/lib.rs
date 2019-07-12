@@ -24,6 +24,9 @@
 extern crate boxfnonce;
 extern crate urlencoding;
 extern crate webview_sys as ffi;
+extern crate serde_derive;
+extern crate serde_json;
+extern crate events_emitter;
 
 mod color;
 mod dialog;
@@ -44,6 +47,31 @@ use std::{
     sync::{Arc, RwLock, Weak},
 };
 use urlencoding::encode;
+
+use events_emitter::EventEmitter;
+
+pub mod Bridge {
+
+    /// Match call from JS with either message or messagePromise
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "subtype", rename_all = "camelCase")]
+    pub enum Incoming {
+        Message { data: serde_json::Value },
+        MessagePromise { id: String, data: serde_json::Value }
+    }
+
+    /// Internal stuct for sending through event emitter
+    // pub struct Internal<'a, T> {
+    pub struct Internal {
+        pub data: serde_json::Value,
+        pub send: Box<Fn(serde_json::Value)>,
+        pub resolve: Box<Fn(serde_json::Value)>,
+        pub reject: Box<Fn(serde_json::Value)>,
+        //pub webview: mem::ManuallyDrop<WebView<'a, T>>,
+    }
+
+}
+
 
 /// Content displayable inside a [`WebView`].
 ///
@@ -250,6 +278,8 @@ struct UserData<'a, T> {
     live: Arc<RwLock<()>>,
     invoke_handler: Box<FnMut(&mut WebView<T>, &str) -> WVResult + 'a>,
     result: WVResult,
+    //emitter: EventEmitter<Bridge::Internal<'a, T>>,
+    emitter: EventEmitter<Bridge::Internal>,
 }
 
 /// An owned webview instance.
@@ -283,6 +313,7 @@ impl<'a, T> WebView<'a, T> {
             live: Arc::new(RwLock::new(())),
             invoke_handler: Box::new(invoke_handler),
             result: Ok(()),
+            emitter: EventEmitter::new(),
         });
         let user_data_ptr = Box::into_raw(user_data);
 
@@ -347,6 +378,12 @@ impl<'a, T> WebView<'a, T> {
         &mut self.user_data_wrapper_mut().inner
     }
 
+    /// Borrows the event listener mutably
+    //pub fn emitter(&mut self) -> &mut EventEmitter<Bridge::Internal<'a, T>> {
+    pub fn emitter(&mut self) -> &mut EventEmitter<Bridge::Internal> {
+        &mut self.user_data_wrapper_mut().emitter
+    }
+
     /// Forces the `WebView` instance to end, without dropping.
     pub fn terminate(&mut self) {
         unsafe { webview_terminate(self.inner) }
@@ -361,6 +398,17 @@ impl<'a, T> WebView<'a, T> {
         } else {
             Ok(())
         }
+    }
+
+    /// Sends a message to the frontend Bridge class
+    /// todo: this only takes a serde_json::Value, show take other types like string
+    pub fn send(&mut self, message: serde_json::Value) -> WVResult {
+        let response = serde_json::json!({
+            "subtype": "TRANSMIT",
+            "message": message
+        });
+
+        self.eval(&format!("bridge.receive({})", response.to_string()))
     }
 
     /// Injects the provided string as CSS within the `WebView` instance.
@@ -544,7 +592,81 @@ extern "C" fn ffi_invoke_handler<T>(webview: *mut CWebView, arg: *const c_char) 
     unsafe {
         let arg = CStr::from_ptr(arg).to_string_lossy().to_string();
         let mut handle = mem::ManuallyDrop::new(WebView::<T>::from_ptr(webview));
-        let result = ((*handle.user_data_wrapper_ptr()).invoke_handler)(&mut *handle, &arg);
-        handle.user_data_wrapper_mut().result = result;
+
+        match serde_json::from_str(&arg) {
+            Err(_) => {
+                // no match, send to invoke_handler
+                let result = ((*handle.user_data_wrapper_ptr()).invoke_handler)(&mut *handle, &arg);
+                handle.user_data_wrapper_mut().result = result;
+            },
+            Ok(command) => {
+                match command {
+                    Bridge::Incoming::Message { data } => {
+                        // match type message
+                        let message = Bridge::Internal {
+                            data: data,
+                            send: Box::new(move |response| {
+                                let mut handle = mem::ManuallyDrop::new(WebView::<T>::from_ptr(webview));
+                                handle.send(response);
+                            }),
+
+                            // resolve and reject will not do anything here, can make them Optional<>
+                            resolve: Box::new(move |response| {
+                            }),
+                            reject: Box::new(move |response| {
+                            }),
+
+                            // Attempting to send reference to webview
+                            //webview: &mut mem::ManuallyDrop::new(WebView::<T>::from_ptr(webview)),
+                            //webview: &mut WebView::<'static, T>::from_ptr(webview),
+                        };
+
+                        // Not sure the difference between these following two lines, either works
+                        //((*handle.user_data_wrapper_ptr()).emitter).emit("message", &message);
+                        handle.emitter().emit("message", &message);
+                    },
+                    Bridge::Incoming::MessagePromise { id, data } => {
+                        // match type message
+                        let id_resolve = id.clone();
+                        let id_reject = id.clone();
+                        let message = Bridge::Internal {
+                            data: data,
+                            send: Box::new(move |response| {
+                                let mut handle = mem::ManuallyDrop::new(WebView::<T>::from_ptr(webview));
+                                handle.send(response);
+                            }),
+                            resolve: Box::new(move |response| {
+                                let mut handle = mem::ManuallyDrop::new(WebView::<T>::from_ptr(webview));
+                                let response = serde_json::json!({
+                                    "subtype": "PROMISE_RENDER",
+                                    "id": id_resolve,
+                                    "status": "RESOLVE",
+                                    "message": response
+                                });
+                                handle.eval(&format!("bridge.receive({})", response.to_string()));
+                            }),
+                            reject: Box::new(move |response| {
+                                let mut handle = mem::ManuallyDrop::new(WebView::<T>::from_ptr(webview));
+                                let response = serde_json::json!({
+                                    "subtype": "PROMISE_RENDER",
+                                    "id": id_reject,
+                                    "status": "REJECT",
+                                    "message": response
+                                });
+                                handle.eval(&format!("bridge.receive({})", response.to_string()));
+                            }),
+
+                            // Attempting to send reference to webview
+                            //webview: &mut mem::ManuallyDrop::new(WebView::<T>::from_ptr(webview)),
+                            //webview: &mut WebView::<'static, T>::from_ptr(webview),
+                        };
+
+                        // Not sure the difference between these following two lines, either works
+                        //((*handle.user_data_wrapper_ptr()).emitter).emit("message", &message);
+                        handle.emitter().emit("messagePromise", &message);
+                    }
+                }
+            }
+        }
     }
 }
